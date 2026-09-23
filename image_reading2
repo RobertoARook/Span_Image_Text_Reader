@@ -1,0 +1,234 @@
+import argparse
+from pathlib import Path
+
+import easyocr
+import matplotlib.pyplot as plt
+import numpy as np
+import pymupdf
+
+
+DEFAULT_IMAGE_SIZE = 2000
+DEFAULT_MERGE_DISTANCE = 50
+DEFAULT_BORDER_WIDTH = 5
+DEFAULT_INPUT_FOLDER = Path(__file__).with_name("text_images")
+DEFAULT_OUTPUT_FOLDER = Path(__file__).with_name("ocr_2000x2000")
+
+
+def render_pdf(pdf_path: Path) -> np.ndarray:
+	"""Render the first page of a PDF as an RGB uint8 array."""
+	with pymupdf.open(pdf_path) as document:
+		if not document.page_count:
+			raise ValueError(f"{pdf_path.name} has no pages")
+		page = document[0]
+		pixmap = page.get_pixmap(alpha=False)
+		return np.frombuffer(pixmap.samples, dtype=np.uint8).reshape(
+			pixmap.height,
+			pixmap.width,
+			3,
+		)
+
+
+def resize_and_normalize(image: np.ndarray, image_size: int) -> np.ndarray:
+	"""Resize to a square and convert grayscale pixels to the range [0, 1]."""
+	if image_size <= 0:
+		raise ValueError("image_size must be greater than 0")
+
+	from PIL import Image
+
+	grayscale = Image.fromarray(image, mode="RGB").convert("L")
+	resized = grayscale.resize((image_size, image_size), Image.Resampling.LANCZOS)
+	normalized = np.asarray(resized, dtype=np.float32) / 255.0
+	return np.clip(normalized, 0.0, 1.0)
+
+
+def boxes_are_close(
+	first: tuple[int, int, int, int],
+	second: tuple[int, int, int, int],
+	merge_distance: int,
+) -> bool:
+	"""Return whether two boxes are within merge_distance in both directions."""
+	first_left, first_top, first_right, first_bottom = first
+	second_left, second_top, second_right, second_bottom = second
+	horizontal_gap = max(first_left - second_right, second_left - first_right, 0)
+	vertical_gap = max(first_top - second_bottom, second_top - first_bottom, 0)
+	return horizontal_gap <= merge_distance and vertical_gap <= merge_distance
+
+
+def merge_nearby_boxes(
+	boxes: list[tuple[int, int, int, int]],
+	merge_distance: int = DEFAULT_MERGE_DISTANCE,
+) -> list[tuple[int, int, int, int]]:
+	"""Merge text boxes that are within merge_distance, including transitively."""
+	if merge_distance < 0:
+		raise ValueError("merge_distance must not be negative")
+
+	merged_boxes = boxes.copy()
+	changed = True
+	while changed:
+		changed = False
+		for first_index in range(len(merged_boxes)):
+			for second_index in range(first_index + 1, len(merged_boxes)):
+				if not boxes_are_close(
+					merged_boxes[first_index],
+					merged_boxes[second_index],
+					merge_distance,
+				):
+					continue
+
+				first = merged_boxes[first_index]
+				second = merged_boxes[second_index]
+				merged_boxes[first_index] = (
+					min(first[0], second[0]),
+					min(first[1], second[1]),
+					max(first[2], second[2]),
+					max(first[3], second[3]),
+				)
+				del merged_boxes[second_index]
+				changed = True
+				break
+			if changed:
+				break
+
+	return merged_boxes
+
+
+def detect_text_boxes(
+	reader: easyocr.Reader,
+	normalized_image: np.ndarray,
+	minimum_confidence: float,
+) -> list[tuple[int, int, int, int]]:
+	"""Detect text and convert EasyOCR polygons to image bounding boxes."""
+	if not 0.0 <= minimum_confidence <= 1.0:
+		raise ValueError("minimum_confidence must be between 0 and 1")
+
+	ocr_image = np.round(normalized_image * 255.0).astype(np.uint8)
+	boxes = []
+	for points, _text, confidence in reader.readtext(ocr_image):
+		if confidence < minimum_confidence:
+			continue
+		polygon = np.asarray(points, dtype=np.float32)
+		left = max(0, int(np.floor(polygon[:, 0].min())))
+		top = max(0, int(np.floor(polygon[:, 1].min())))
+		right = min(normalized_image.shape[1], int(np.ceil(polygon[:, 0].max())) + 1)
+		bottom = min(normalized_image.shape[0], int(np.ceil(polygon[:, 1].max())) + 1)
+		if right > left and bottom > top:
+			boxes.append((left, top, right, bottom))
+	return boxes
+
+
+def draw_red_borders(
+	normalized_image: np.ndarray,
+	boxes: list[tuple[int, int, int, int]],
+	border_width: int = DEFAULT_BORDER_WIDTH,
+) -> np.ndarray:
+	"""Return an RGB image with red borders around merged text boxes."""
+	if border_width <= 0:
+		raise ValueError("border_width must be greater than 0")
+
+	annotated = np.repeat(normalized_image[:, :, np.newaxis], 3, axis=2)
+	height, width = normalized_image.shape
+	red = np.array([1.0, 0.0, 0.0], dtype=np.float32)
+
+	for left, top, right, bottom in boxes:
+		left = max(0, left - border_width)
+		top = max(0, top - border_width)
+		right = min(width, right + border_width)
+		bottom = min(height, bottom + border_width)
+		annotated[top:min(bottom, top + border_width), left:right] = red
+		annotated[max(top, bottom - border_width):bottom, left:right] = red
+		annotated[top:bottom, left:min(right, left + border_width)] = red
+		annotated[top:bottom, max(left, right - border_width):right] = red
+
+	return np.clip(annotated, 0.0, 1.0)
+
+
+def display_image(image: np.ndarray, name: str) -> None:
+	"""Display the annotated normalized image with Matplotlib."""
+	plt.figure(figsize=(10, 10))
+	plt.imshow(image, vmin=0.0, vmax=1.0)
+	plt.axis("off")
+	plt.title(f"Detected text: {name}")
+	plt.show()
+	plt.close()
+
+
+def process_pdfs(
+	input_folder: Path,
+	output_folder: Path,
+	image_size: int,
+	merge_distance: int,
+	minimum_confidence: float,
+	display_images: bool,
+) -> None:
+	"""Process every PDF, detect text, merge nearby boxes, and display results."""
+	pdf_files = sorted(input_folder.glob("*.pdf"))
+	if not pdf_files:
+		raise FileNotFoundError(f"No PDF files found in {input_folder}")
+
+	reader = easyocr.Reader(["en"], gpu=False)
+	output_folder.mkdir(parents=True, exist_ok=True)
+
+	for pdf_path in pdf_files:
+		rgb_image = render_pdf(pdf_path)
+		normalized_image = resize_and_normalize(rgb_image, image_size)
+		boxes = detect_text_boxes(reader, normalized_image, minimum_confidence)
+		merged_boxes = merge_nearby_boxes(boxes, merge_distance)
+		annotated_image = draw_red_borders(normalized_image, merged_boxes)
+
+		array_path = output_folder / f"{pdf_path.stem}_annotated.npy"
+		image_path = output_folder / f"{pdf_path.stem}_annotated.png"
+		np.save(array_path, annotated_image)
+		plt.imsave(image_path, annotated_image)
+		print(
+			f"{pdf_path.name}: detected {len(boxes)} boxes, "
+			f"merged to {len(merged_boxes)} boxes"
+		)
+		print(f"Saved array: {array_path}")
+		print(f"Saved image: {image_path}")
+
+		if display_images:
+			display_image(annotated_image, pdf_path.stem)
+
+
+def main() -> None:
+	parser = argparse.ArgumentParser(
+		description="Detect text with EasyOCR and draw merged red borders."
+	)
+	parser.add_argument("--input", type=Path, default=DEFAULT_INPUT_FOLDER)
+	parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT_FOLDER)
+	parser.add_argument(
+		"--size",
+		type=int,
+		default=DEFAULT_IMAGE_SIZE,
+		help="Square image resolution, default 2000.",
+	)
+	parser.add_argument(
+		"--merge-distance",
+		type=int,
+		default=DEFAULT_MERGE_DISTANCE,
+		help="Maximum gap for merging nearby text boxes, default 50 pixels.",
+	)
+	parser.add_argument(
+		"--minimum-confidence",
+		type=float,
+		default=0.30,
+		help="Minimum EasyOCR confidence for a detected text box.",
+	)
+	parser.add_argument(
+		"--no-display",
+		action="store_true",
+		help="Save results without opening Matplotlib windows.",
+	)
+	args = parser.parse_args()
+	process_pdfs(
+		args.input,
+		args.output,
+		args.size,
+		args.merge_distance,
+		args.minimum_confidence,
+		not args.no_display,
+	)
+
+
+if __name__ == "__main__":
+	main()
