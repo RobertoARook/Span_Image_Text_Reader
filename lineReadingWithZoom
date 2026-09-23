@@ -1,0 +1,214 @@
+import argparse
+from pathlib import Path
+
+import matplotlib.pyplot as plt
+import numpy as np
+import pymupdf
+from PIL import Image
+
+
+IMAGE_SIZE = 2000
+DEFAULT_INPUT_FOLDER = Path(__file__).with_name("text_images_span")
+DEFAULT_OUTPUT_FOLDER = Path(__file__).with_name("300x300_images")
+
+
+def render_pdf(pdf_path: Path) -> Image.Image:
+	"""Render the first page of a PDF as an RGB image."""
+	with pymupdf.open(pdf_path) as document:
+		if not document.page_count:
+			raise ValueError(f"{pdf_path.name} does not contain any pages")
+
+		page = document[0]
+		pixmap = page.get_pixmap(alpha=False)
+		return Image.frombytes("RGB", (pixmap.width, pixmap.height), pixmap.samples)
+
+
+def downsample(image: Image.Image, image_size: int = IMAGE_SIZE) -> Image.Image:
+	"""Resize an image to exactly image_size by image_size pixels."""
+	if image_size <= 0:
+		raise ValueError("image_size must be greater than 0")
+	return image.resize((image_size, image_size), Image.Resampling.LANCZOS)
+
+
+def normalize_pixels(image: Image.Image) -> np.ndarray:
+	"""Convert an image to grayscale and normalize pixels to values from 0 to 1."""
+	grayscale_image = image.convert("L")
+	normalized_pixels = np.asarray(grayscale_image, dtype=np.float32) / 255.0
+	return np.clip(normalized_pixels, 0.0, 1.0)
+
+
+def remove_dark_blocks(
+	image_array: np.ndarray,
+	block_size: int = 50,
+	mean_threshold: float = 0.650,
+) -> np.ndarray:
+	"""Replace 50x50 blocks at or below the grayscale threshold with white."""
+	if image_array.ndim != 2:
+		raise ValueError("image_array must be a 2D grayscale array")
+	if block_size <= 0 or image_array.shape[0] % block_size or image_array.shape[1] % block_size:
+		raise ValueError("image dimensions must be evenly divisible by block_size")
+	if not 0.0 <= mean_threshold <= 1.0:
+		raise ValueError("mean_threshold must be between 0 and 1")
+
+	cleaned_array = image_array.copy()
+	for top in range(0, image_array.shape[0], block_size):
+		for left in range(0, image_array.shape[1], block_size):
+			block = image_array[top:top + block_size, left:left + block_size]
+			if float(block.mean()) <= mean_threshold:
+				cleaned_array[top:top + block_size, left:left + block_size] = 1.0
+
+	return cleaned_array
+
+
+def keep_large_connected_areas(
+	image_array: np.ndarray,
+	minimum_width: int = 200,
+	minimum_height: int = 200,
+) -> np.ndarray:
+	"""Keep the largest area and other connected areas at least 200x200."""
+	if image_array.ndim != 2:
+		raise ValueError("image_array must be a 2D grayscale array")
+	if minimum_width <= 0 or minimum_height <= 0:
+		raise ValueError("minimum dimensions must be positive")
+
+	foreground = image_array < 1.0
+	visited = np.zeros(foreground.shape, dtype=bool)
+	labels = np.full(foreground.shape, -1, dtype=np.int32)
+	component_sizes: list[int] = []
+	component_bounds: list[tuple[int, int, int, int]] = []
+	height, width = foreground.shape
+
+	for start_row in range(height):
+		for start_column in range(width):
+			if not foreground[start_row, start_column] or visited[start_row, start_column]:
+				continue
+
+			label = len(component_sizes)
+			stack = [(start_row, start_column)]
+			visited[start_row, start_column] = True
+			labels[start_row, start_column] = label
+			component_size = 0
+			min_row = max_row = start_row
+			min_column = max_column = start_column
+
+			while stack:
+				row, column = stack.pop()
+				component_size += 1
+				min_row = min(min_row, row)
+				max_row = max(max_row, row)
+				min_column = min(min_column, column)
+				max_column = max(max_column, column)
+
+				for next_row in range(row - 1, row + 2):
+					for next_column in range(column - 1, column + 2):
+						if (
+							0 <= next_row < height
+							and 0 <= next_column < width
+							and foreground[next_row, next_column]
+							and not visited[next_row, next_column]
+						):
+							visited[next_row, next_column] = True
+							labels[next_row, next_column] = label
+							stack.append((next_row, next_column))
+
+			component_sizes.append(component_size)
+			component_bounds.append((min_row, max_row, min_column, max_column))
+
+	if not component_sizes:
+		return image_array.copy()
+
+	largest_label = int(np.argmax(component_sizes))
+	keep_labels = {largest_label}
+	for label, bounds in enumerate(component_bounds):
+		min_row, max_row, min_column, max_column = bounds
+		component_width = max_column - min_column + 1
+		component_height = max_row - min_row + 1
+		if component_width >= minimum_width and component_height >= minimum_height:
+			keep_labels.add(label)
+
+	keep_mask = np.isin(labels, list(keep_labels))
+	cleaned_array = np.ones_like(image_array)
+	cleaned_array[keep_mask] = image_array[keep_mask]
+	return cleaned_array
+
+
+def zoom_into_remaining_area(
+	image_array: np.ndarray,
+	padding: int = 10,
+) -> np.ndarray:
+	"""Crop white borders so the remaining image fills the display."""
+	if image_array.ndim != 2:
+		raise ValueError("image_array must be a 2D grayscale array")
+	if padding < 0:
+		raise ValueError("padding must not be negative")
+
+	non_white_pixels = image_array < 1.0
+	rows, columns = np.where(non_white_pixels)
+	if len(rows) == 0:
+		return image_array.copy()
+
+	top = max(0, int(rows.min()) - padding)
+	bottom = min(image_array.shape[0], int(rows.max()) + padding + 1)
+	left = max(0, int(columns.min()) - padding)
+	right = min(image_array.shape[1], int(columns.max()) + padding + 1)
+	return image_array[top:bottom, left:right]
+
+
+def display_image(image_array: np.ndarray, image_name: str) -> None:
+	"""Display a normalized image where 0 is black and 1 is white."""
+	plt.figure(figsize=(5, 5))
+	plt.imshow(image_array, cmap="gray", vmin=0.0, vmax=1.0)
+	plt.axis("off")
+	plt.title(f"{image_name} | {image_array.shape[1]} x {image_array.shape[0]}")
+	plt.show()
+	plt.close()
+
+
+def process_images(
+	input_folder: Path,
+	output_folder: Path,
+	display_images: bool,
+) -> None:
+	"""Process every PDF in input_folder and optionally display each result."""
+	pdf_files = sorted(input_folder.glob("*.pdf"))
+	if not pdf_files:
+		raise FileNotFoundError(f"No PDF files found in {input_folder}")
+
+	output_folder.mkdir(parents=True, exist_ok=True)
+	for pdf_path in pdf_files:
+		original_image = render_pdf(pdf_path)
+		resized_image = downsample(original_image)
+		normalized_array = normalize_pixels(resized_image)
+		cleaned_array = remove_dark_blocks(normalized_array)
+		cleaned_array = keep_large_connected_areas(cleaned_array)
+		cleaned_array = zoom_into_remaining_area(cleaned_array)
+		output_path = output_folder / f"{pdf_path.stem}.npy"
+		np.save(output_path, cleaned_array)
+
+		print(
+			f"{pdf_path.name}: shape={cleaned_array.shape}, "
+			f"range=({cleaned_array.min():.1f}, {cleaned_array.max():.1f})"
+		)
+		print(f"Saved normalized image: {output_path}")
+
+		if display_images:
+			display_image(cleaned_array, pdf_path.stem)
+
+
+def main() -> None:
+	parser = argparse.ArgumentParser(
+		description="Resize PDF images to 300x300 and normalize pixels to 0-1."
+	)
+	parser.add_argument("--input", type=Path, default=DEFAULT_INPUT_FOLDER)
+	parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT_FOLDER)
+	parser.add_argument(
+		"--no-display",
+		action="store_true",
+		help="Process and save images without opening display windows.",
+	)
+	args = parser.parse_args()
+	process_images(args.input, args.output, not args.no_display)
+
+
+if __name__ == "__main__":
+	main()
